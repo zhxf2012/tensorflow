@@ -22,6 +22,7 @@ from __future__ import print_function
 
 import collections
 import math
+import time
 
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
@@ -45,8 +46,13 @@ from tensorflow.python.ops import gen_data_flow_ops
 from tensorflow.python.ops import gen_logging_ops
 from tensorflow.python.ops import gen_state_ops
 from tensorflow.python.ops import gradients_impl
+from tensorflow.python.ops import init_ops
+from tensorflow.python.ops import linalg_ops
 from tensorflow.python.ops import logging_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import nn_grad  # pylint: disable=unused-import
+from tensorflow.python.ops import nn_ops
+from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import script_ops
 from tensorflow.python.ops import state_ops
@@ -93,6 +99,16 @@ def all_fetchables():
       if graph.is_fetchable(t):
         tensor_names.append(t.name)
   return tensor_names
+
+
+def all_feedables():
+  feedable_tensors = []
+  graph = ops.get_default_graph()
+  for op in graph.get_operations():
+    for t in op.inputs:
+      if graph.is_feedable(t):
+        feedable_tensors.append(t)
+  return feedable_tensors
 
 
 def opt_cfg():
@@ -186,7 +202,7 @@ class ControlFlowTest(test.TestCase):
 
       with self.assertRaisesWithPredicateMatch(
           errors_impl.InvalidArgumentError,
-          lambda e: "The tensor returned for" in str(e)):
+          lambda e: "Retval[0] does not have value" in str(e)):
         dead_branch.eval()
 
   def testSwitchMergeLess(self):
@@ -313,15 +329,40 @@ class ControlFlowTest(test.TestCase):
     with self.assertRaisesRegexp(TypeError, "must not be a Python bool"):
       _ = control_flow_ops.cond(False, fn1, fn2)
 
+  def testCondInt(self):
+    p = array_ops.placeholder(dtypes.bool, shape=[])
+    v = constant_op.constant(10)
+    fn1 = lambda: math_ops.add(v, 1)
+    fn2 = lambda: math_ops.subtract(v, 1)
+    y = control_flow_ops.cond(p, fn1, fn2)
+    grad = gradients_impl.gradients(y, [v])
+    self.assertAllEqual([None], grad)
+
   def testFetchables(self):
     with self.test_session() as sess:
       x = array_ops.placeholder(dtypes.float32)
-      control_flow_ops.cond(constant_op.constant(True),
-                            lambda: x + 2,
-                            lambda: x + 0)
+      control_flow_ops.cond(
+          constant_op.constant(True), lambda: x + 2, lambda: x + 0)
       tensor_names = all_fetchables()
       for name in tensor_names:
         sess.run(name, feed_dict={x: 3})
+
+  def testFeedable(self):
+    with self.test_session() as sess:
+      c = constant_op.constant(2)
+      i0 = constant_op.constant(0)
+      r = control_flow_ops.while_loop(lambda i: i < 1000,
+                                      lambda i: math_ops.square(c) + i, [i0])
+      self.assertEqual(1000, r.eval(feed_dict={i0: 0}))
+      feedable_tensors = all_feedables()
+      for t in feedable_tensors:
+        sess.run(r, feed_dict={t: 3})
+      graph = ops.get_default_graph()
+      for op in graph.get_operations():
+        for t in op.inputs:
+          if t not in feedable_tensors and t.dtype is dtypes.int32:
+            with self.assertRaisesRegexp(ValueError, "may not be fed"):
+              sess.run(r, feed_dict={t: 3})
 
   def testCondIndexedSlices(self):
     with self.test_session():
@@ -361,11 +402,12 @@ class ControlFlowTest(test.TestCase):
       rv = resource_variable_ops.ResourceVariable(True)
       variables.global_variables_initializer().run()
       t = ops.convert_to_tensor(1.0)
+
       def case():
-        assign = resource_variable_ops.assign_variable_op(
-            rv.handle, False)
+        assign = resource_variable_ops.assign_variable_op(rv.handle, False)
         with ops.control_dependencies([assign]):
           return array_ops.identity(t)
+
       self.assertEqual(1.0, control_flow_ops.cond(rv, case, lambda: t).eval())
 
   def testCondIndexedSlicesDifferentTypes(self):
@@ -517,13 +559,15 @@ class ControlFlowTest(test.TestCase):
     with self.test_session() as sess:
       control_holder = array_ops.placeholder(dtypes.float32, shape=())
       a = constant_op.constant(3)
+
       def true_branch():
         with ops.control_dependencies([control_holder]):
           _ = a + 1
         return a + 2
-      r = control_flow_ops.cond(constant_op.constant(True),
-                                true_branch,
-                                lambda: constant_op.constant(1))
+
+      r = control_flow_ops.cond(
+          constant_op.constant(True), true_branch,
+          lambda: constant_op.constant(1))
       self.assertEqual(5, r.eval())
 
   def testUninitializedRefIdentity(self):
@@ -743,15 +787,36 @@ class ControlFlowTest(test.TestCase):
       o = ops.convert_to_tensor([0])
       x = ops.convert_to_tensor([1, 2, 3, 4, 5, 6])
       s = array_ops.size(x)
-      r = control_flow_ops.while_loop(lambda i, c, o: math_ops.less(i, s),
-                                      compute, [i, c, o], [
-                                          i.get_shape(),
-                                          tensor_shape.unknown_shape(),
-                                          tensor_shape.unknown_shape()
-                                      ])
+      r = control_flow_ops.while_loop(
+          lambda i, c, o: math_ops.less(i, s), compute, [i, c, o], [
+              i.get_shape(), tensor_shape.unknown_shape(),
+              tensor_shape.unknown_shape()
+          ])
       result = r[2].eval()
     self.assertTrue(check_op_order(i.graph))
     self.assertAllEqual(np.array([0, 1, 2, 3, 4, 5, 6]), result)
+
+  def testBufferForwarding(self):
+    run_options = config_pb2.RunOptions(
+        trace_level=config_pb2.RunOptions.FULL_TRACE)
+    run_metadata = config_pb2.RunMetadata()
+
+    with self.test_session() as sess:
+      with ops.device("/cpu:0"):
+        c = constant_op.constant(2)
+        i0 = constant_op.constant(0)
+        r = control_flow_ops.while_loop(lambda i: i < 1000,
+                                        lambda i: math_ops.square(c) + i, [i0])
+      r_val = sess.run(r, options=run_options, run_metadata=run_metadata)
+      self.assertEqual(1000, r_val)
+      self.assertTrue(run_metadata.HasField("step_stats"))
+      unique_allocs = set()
+      for node_stat in run_metadata.step_stats.dev_stats[0].node_stats:
+        for output in node_stat.output:
+          unique_allocs.add(
+              output.tensor_description.allocation_description.ptr)
+      # Prior to cl/147536680, the number of unique allocations was about 1005.
+      self.assertLess(len(unique_allocs), 756)
 
   def _testWhile_Gpu_1(self, use_gpu):
     with self.test_session(use_gpu=use_gpu):
@@ -1023,6 +1088,27 @@ class ControlFlowTest(test.TestCase):
         loop = control_flow_ops.while_loop(cond, body,
                                            (constant_op.constant(5),))
       self.assertEqual(0, sess.run(loop))
+
+  def testWhileCondWithControl_1(self):
+    with self.test_session():
+      v = variable_scope.get_variable(
+          "v", [], initializer=init_ops.constant_initializer(2))
+      i0 = constant_op.constant(0)
+      with ops.control_dependencies([i0]):
+        def loop_condition(i):
+          return i < 4
+
+        def loop_body(i):
+          some_cond = control_flow_ops.cond(
+              constant_op.constant(True),
+              lambda: state_ops.assign(v, math_ops.square(v)),
+              lambda: v)
+          with ops.control_dependencies([some_cond]):
+            return i + 1
+      r = control_flow_ops.while_loop(loop_condition, loop_body, (i0,))
+      variables.global_variables_initializer().run()
+      self.assertEqual(4, r.eval())
+      self.assertAllClose(65536.0, v.eval())
 
   def testWhileCondExitControl(self):
     with self.test_session():
@@ -1341,8 +1427,8 @@ class ControlFlowTest(test.TestCase):
       self.assertEqual(45, rx.eval())
 
   def _testWhileGrad_ColocateGradients(self, colocate):
-    gpu_dev_name = test.gpu_device_name() if test.is_gpu_available() else "/gpu:0"
-    gpu_short_name = gpu_dev_name.split('/')[-1]
+    gpu_dev_name = test.gpu_device_name() if test.is_gpu_available(
+    ) else "/device:GPU:0"
 
     with self.test_session(graph=ops.Graph()) as sess:
       v = constant_op.constant(2.0, name="v")
@@ -1356,19 +1442,19 @@ class ControlFlowTest(test.TestCase):
       r = gradients_impl.gradients(
           loop, v, colocate_gradients_with_ops=colocate)[0]
     r_ops = r.graph.get_operations()
-    r_devices = [(op.name, op.device.lower()) for op in r_ops]
+    r_devices = [(op.name, op.device) for op in r_ops]
 
     self.assertTrue(any("Square" in op.name for op in r_ops))
 
     for (name, dev) in r_devices:
       if not colocate and name.endswith("Square"):
         # Only forward graph contain gpu in Square device
-        self.assertTrue(gpu_short_name in dev)
+        self.assertTrue(gpu_dev_name in dev)
       elif colocate and "Square" in name:
         # Forward and backward graphs contain gpu in Square/Square_grad devices
-        self.assertTrue(gpu_short_name in dev)
+        self.assertTrue(gpu_dev_name in dev)
       else:
-        self.assertFalse(gpu_short_name in dev)
+        self.assertFalse(gpu_dev_name in dev)
     self.assertAllClose(1024.0, sess.run(r))
 
   def testWhileGrad_ColocateGradients(self):
@@ -1458,16 +1544,21 @@ class ControlFlowTest(test.TestCase):
   def _testNestedWhileCondWhileGrad(self, use_gpu):
     with self.test_session(use_gpu=use_gpu):
       v = constant_op.constant(1.0)
+
       def inner_loop(s):
         z = constant_op.constant(0)
         c = lambda i, x: math_ops.less(i, 4)
         b = lambda i, x: [math_ops.add(i, 1), math_ops.multiply(x, 2.0)]
         return control_flow_ops.while_loop(c, b, [z, s])
+
       c = lambda x: math_ops.less(x, 128.0)
+
       def b(x):
-        return control_flow_ops.cond(constant_op.constant(True),
-                                     lambda: math_ops.square(inner_loop(x)[1]),
-                                     lambda: math_ops.multiply(x, 2.0))
+        return control_flow_ops.cond(
+            constant_op.constant(True),
+            lambda: math_ops.square(inner_loop(x)[1]),
+            lambda: math_ops.multiply(x, 2.0))
+
       r = control_flow_ops.while_loop(c, b, [v])
       r = gradients_impl.gradients(r, v)[0]
       self.assertAllClose(512.0, r.eval())
@@ -1523,10 +1614,9 @@ class ControlFlowTest(test.TestCase):
     with self.test_session() as sess:
       named = collections.namedtuple("named", ("a", "b"))
       loop_vars = [
-          named(
-              a=constant_op.constant(0.0), b=constant_op.constant(1.0)),
-          (constant_op.constant(2.0), constant_op.constant(3.0)),
-          constant_op.constant(4.0)
+          named(a=constant_op.constant(0.0), b=constant_op.constant(1.0)),
+          (constant_op.constant(2.0),
+           constant_op.constant(3.0)), constant_op.constant(4.0)
       ]
       c = lambda lv0, _1, _2: lv0.a < 100.0
 
@@ -1551,10 +1641,9 @@ class ControlFlowTest(test.TestCase):
     with self.test_session():
       named = collections.namedtuple("named", ("a", "b"))
       loop_vars = [
-          named(
-              a=constant_op.constant(0.0), b=constant_op.constant(1.0)),
-          (constant_op.constant(2.0), constant_op.constant(3.0)),
-          constant_op.constant(4.0)
+          named(a=constant_op.constant(0.0), b=constant_op.constant(1.0)),
+          (constant_op.constant(2.0),
+           constant_op.constant(3.0)), constant_op.constant(4.0)
       ]
       c = lambda lv0, _1, _2: lv0.a < 100.0
 
@@ -1619,15 +1708,16 @@ class ControlFlowTest(test.TestCase):
   def testWhileGrad_NoDependency(self):
     with self.test_session() as sess:
       variable = variables.Variable(array_ops.ones([2, 3]))
-      time = array_ops.zeros([], dtype=dtypes.int32)
+      duration = array_ops.zeros([], dtype=dtypes.int32)
 
-      def cond(time, tensor, _):
-        return time < 10
+      def cond(duration, tensor, _):
+        del tensor
+        return duration < 10
 
-      def body(time, tensor, _):
-        return (time + 1, tensor, tensor)
+      def body(duration, tensor, _):
+        return (duration + 1, tensor, tensor)
 
-      loop_vars = [time, variable, variable]
+      loop_vars = [duration, variable, variable]
       tensors = control_flow_ops.while_loop(
           cond=cond, body=body, loop_vars=loop_vars)
       cost = math_ops.reduce_sum(tensors[2])
@@ -1639,15 +1729,15 @@ class ControlFlowTest(test.TestCase):
     with self.test_session() as sess:
       c0 = constant_op.constant(0.0, name="c0")
       c1 = constant_op.constant(1.0, name="c1")
-      time = constant_op.constant(0, name="t")
+      duration = constant_op.constant(0, name="t")
 
-      def cond(time, _):
-        return time < 1
+      def cond(duration, _):
+        return duration < 1
 
-      def body(time, tensor):
-        return time + 1, c1
+      def body(duration, _):
+        return duration + 1, c1
 
-      loop_vars = [time, c0]
+      loop_vars = [duration, c0]
       tensors = control_flow_ops.while_loop(
           cond=cond, body=body, loop_vars=loop_vars)
       cost = math_ops.reduce_sum(tensors[1])
@@ -2085,6 +2175,29 @@ class ControlFlowTest(test.TestCase):
       r = gradients_impl.gradients(r, y)[0]
       self.assertEqual(388.0, r.eval())
 
+  def testStopGradMultiFlows(self):
+    with self.test_session():
+      def body(i, y, r):
+        x = variable_scope.get_variable(
+            "x", shape=(), dtype=dtypes.float32,
+            initializer=init_ops.ones_initializer())
+        y *= x
+        return [i + 1, y, r + math_ops.reduce_sum(y)]
+
+      i0 = constant_op.constant(0)
+      y0 = array_ops.ones(5)
+      r0 = constant_op.constant(0.0)
+      cond = lambda i, y, r: i < 1
+      _, _, r = control_flow_ops.while_loop(
+          cond, body, [i0, y0, r0], back_prop=True)
+
+      vars_ = variables.global_variables()
+      grads = linalg_ops.norm(gradients_impl.gradients(r, vars_)[0])
+      z = math_ops.add(r, array_ops.stop_gradient(math_ops.reduce_sum(grads)))
+      result = gradients_impl.gradients(z, vars_)[0]
+      variables.global_variables_initializer().run()
+      self.assertEqual(5.0, result.eval())
+
   def testOneValueCond(self):
     with self.test_session():
       c = array_ops.placeholder(dtypes.int32, shape=[])
@@ -2317,7 +2430,7 @@ class ControlFlowTest(test.TestCase):
 
       # device set on tensor, default device on graph => default device on dep.
       vdef = variables.Variable([0.0], name="vdef")
-      with ops.device("/job:worker/gpu:1"):
+      with ops.device("/job:worker/device:GPU:1"):
         with_vdef_dep = control_flow_ops.with_dependencies([vdef.initializer],
                                                            vdef)
         # The device is empty, but the colocation constraint is set.
@@ -2495,15 +2608,11 @@ class TupleTest(test.TestCase):
       with self.test_session():
         v1 = variables.Variable([1.0])
         add1 = math_ops.add(
-            control_flow_ops.with_dependencies(
-                [v1.initializer],
-                v1._ref()),  # pylint: disable=protected-access
+            control_flow_ops.with_dependencies([v1.initializer], v1._ref()),  # pylint: disable=protected-access
             2.0)
         v2 = variables.Variable([10.0])
         add2 = math_ops.add(
-            control_flow_ops.with_dependencies(
-                [v2.initializer],
-                v2._ref()),  # pylint: disable=protected-access
+            control_flow_ops.with_dependencies([v2.initializer], v2._ref()),  # pylint: disable=protected-access
             20.0)
         t1, _, t2 = control_flow_ops.tuple([add1, None, add2])
 
@@ -2531,18 +2640,14 @@ class TupleTest(test.TestCase):
             np.array([[0.0, 1.0], [10.0, 11.0], [20.0, 21.0]]).astype(
                 np.float32))
         v1_at_1 = ops.IndexedSlices(
-            control_flow_ops.with_dependencies(
-                [v1.initializer],
-                v1._ref()),  # pylint: disable=protected-access
+            control_flow_ops.with_dependencies([v1.initializer], v1._ref()),  # pylint: disable=protected-access
             constant_op.constant([1]))
 
         v2 = variables.Variable(
             np.array([[0.1, 1.1], [10.1, 11.1], [20.1, 21.1]]).astype(
                 np.float32))
         v2_at_1 = ops.IndexedSlices(
-            control_flow_ops.with_dependencies(
-                [v2.initializer],
-                v2._ref()),  # pylint: disable=protected-access
+            control_flow_ops.with_dependencies([v2.initializer], v2._ref()),  # pylint: disable=protected-access
             constant_op.constant([1]))
 
         st1, st2 = control_flow_ops.tuple([v1_at_1, v2_at_1])
@@ -2616,6 +2721,119 @@ class AssertTest(test.TestCase):
         self.assertLess(0, len(unguarded_memcpy_nodestat_names))
       # No copy was performed for the guarded assert
       self.assertEqual([], guarded_memcpy_nodestat_names)
+
+
+class WhileOpBenchmark(test.Benchmark):
+  """Evaluate the performance of while_loop op."""
+
+  def _getInitVariables(self):
+    batch_size = 10
+    image_size = 256
+    kernel_size = 3
+    depth = 16
+
+    init_step = constant_op.constant(-1)
+    image = variable_scope.get_variable(
+        "image",
+        initializer=random_ops.random_normal(
+            [batch_size, image_size, image_size, depth],
+            dtype=dtypes.float32,
+            stddev=1e-1))
+    kernel = variable_scope.get_variable(
+        "weights",
+        initializer=random_ops.truncated_normal(
+            [kernel_size, kernel_size, depth, depth],
+            dtype=dtypes.float32,
+            stddev=1e-1))
+    return init_step, image, kernel
+
+  def _runOneBenchmark(self,
+                       default_device,
+                       num_iters=10,
+                       static_unroll=False,
+                       steps=10):
+    """Evaluate the while loop performance.
+
+    Args:
+      default_device: The default device to run all ops except the loop_body.
+        loop_body is always run on GPU.
+      num_iters: Number of iterations to run.
+      static_unroll: If true, run unrolled version; otherwise, run while_loop.
+      steps: Total number of repeated steps to run the loop.
+
+    Returns:
+      The duration of the run in seconds.
+    """
+    def loop_body(i, x):
+      with ops.device("/gpu:0"):
+        # Always put loop body on GPU.
+        nx = nn_ops.conv2d(
+            input=x,
+            filter=kernel,
+            strides=[1, 1, 1, 1],
+            padding="SAME",
+            data_format="NHWC",
+            name="conv2d")
+        ni = math_ops.add(i, 1)
+        return ni, nx
+
+    ops.reset_default_graph()
+    with session.Session() as sess, ops.device(default_device):
+      # Get the initial id i, input x, and kernel.
+      i, x, kernel = self._getInitVariables()
+      sess.run(variables.global_variables_initializer())
+
+      if static_unroll:
+        for _ in xrange(steps):
+          i, x = loop_body(i, x)
+      else:
+        i, x = control_flow_ops.while_loop(
+            lambda i, _: i < steps,
+            loop_body, [i, x],
+            parallel_iterations=steps,
+            swap_memory=True)
+
+      r = math_ops.reduce_sum(x)
+      dx, dk = gradients_impl.gradients(r, [x, kernel])
+      # Use group to avoid fetching back results.
+      r = control_flow_ops.group(dx, dk)
+
+      for _ in xrange(3):
+        # exclude warm up time
+        sess.run(r)
+
+      start_time = time.time()
+      for _ in xrange(num_iters):
+        sess.run(r)
+      return (time.time() - start_time)/num_iters
+
+  def benchmarkWhileOpCrossDevicePlacement(self):
+    iters = 10
+    # Run loop body on GPU, but other ops on CPU.
+    duration = self._runOneBenchmark("cpu", iters, static_unroll=False)
+    self.report_benchmark(
+        name="while_op_cross_device", iters=iters, wall_time=duration)
+
+  def benchmarkWhileOpSameDevicePlacement(self):
+    iters = 10
+    # Run all ops on the same GPU device.
+    duration = self._runOneBenchmark("gpu", iters, static_unroll=False)
+    self.report_benchmark(
+        name="while_op_same_device", iters=iters, wall_time=duration)
+
+  def benchmarkWhileOpUnrollCrossDevicePlacement(self):
+    iters = 10
+    # Run loop body on GPU, but other ops on CPU.
+    duration = self._runOneBenchmark("cpu", iters, static_unroll=True)
+    self.report_benchmark(
+        name="unroll_cross_device_cpu", iters=iters, wall_time=duration)
+
+  def benchmarkWhileOpUnrollSameDevicePlacement(self):
+    iters = 10
+    # Run all ops on GPU.
+    duration = self._runOneBenchmark("gpu", iters, static_unroll=True)
+    self.report_benchmark(
+        name="unroll_same_device", iters=iters, wall_time=duration)
 
 
 if __name__ == "__main__":
